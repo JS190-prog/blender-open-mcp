@@ -1,0 +1,18 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# 사용자 작업 파일·대용량·백업 (공개/업로드 제외)
+3D_projects/
+python/
+logs/
+*.bak
+*.bak-*
+*.bak_*
