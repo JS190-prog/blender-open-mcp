@@ -164,3 +164,7 @@ For further assistance, visit the [GitHub Issues](https://github.com/dhakalniraj
 ---
 
 Happy Blending with AI! 🚀
+
+## ⚠️ Disclaimer
+
+This MCP server lets AI models directly control Blender, including executing AI-generated Python code inside Blender. AI-generated operations may behave unexpectedly and can damage scenes, files, or data. The authors take no responsibility for any damage caused by using this software. Always back up important work before use. (See the no-warranty clause in the LICENSE.)
