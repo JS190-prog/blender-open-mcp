@@ -21,12 +21,18 @@ logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("BlenderMCPServer")
 
+# Socket read timeout (seconds). Synchronous calls on large scenes block
+# Blender's main thread for a long time, so the default is generous and can be
+# overridden via BLENDER_MCP_TIMEOUT. For unbounded work prefer the async job
+# tools (start_blender_job) which return immediately and are polled.
+_DEFAULT_TIMEOUT = float(os.environ.get("BLENDER_MCP_TIMEOUT", "180"))
+
 @dataclass
 class BlenderConnection:
     host: str
     port: int
     sock: Optional[socket.socket] = None
-    timeout: float = 15.0  # Added timeout as a property
+    timeout: float = _DEFAULT_TIMEOUT  # override via BLENDER_MCP_TIMEOUT
 
     def __post_init__(self):
          if not isinstance(self.host, str):
@@ -132,10 +138,15 @@ class BlenderConnection:
             raise
 
 
-    def send_command(self, command_type: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def send_command(self, command_type: str, params: Optional[Dict[str, Any]] = None,
+                     timeout: Optional[float] = None) -> Dict[str, Any]:
          if not self.sock and not self.connect():
             raise ConnectionError("Not connected")
          command = {"type": command_type, "params": params or {}}
+         # Per-command timeout override (e.g. short for fast job polling). The
+         # persistent socket's default timeout is restored in finally.
+         if timeout is not None and self.sock:
+             self.sock.settimeout(timeout)
          try:
               logger.info(f"Sending command: {command_type} with params: {params}")
               self.sock.sendall(json.dumps(command).encode('utf-8'))
@@ -166,6 +177,13 @@ class BlenderConnection:
               logger.error(f"Error communicating with Blender: {e!s}")
               self.sock = None # reset socket connection
               raise Exception(f"Communication error: {e!s}")
+         finally:
+              # Restore the persistent socket's default read timeout.
+              if timeout is not None and self.sock:
+                  try:
+                      self.sock.settimeout(self.timeout)
+                  except Exception:
+                      pass
 
 
 @asynccontextmanager
@@ -250,9 +268,14 @@ def _send_blender_command(command: str, params: Optional[Dict[str, Any]] = None)
     except Exception as e:
         return _format_error(e)
 
-def get_blender_connection() -> BlenderConnection:
+def get_blender_connection(check: bool = True) -> BlenderConnection:
     global _blender_connection, _polyhaven_enabled
     if _blender_connection:
+        if not check:
+            # Skip the polyhaven health-check (which is dispatched on Blender's
+            # main thread) so job-status polling stays responsive while a long
+            # async job is blocking the main thread.
+            return _blender_connection
         try:
             result = _blender_connection.send_command("get_polyhaven_status")
             _polyhaven_enabled = result.get("enabled", False)
@@ -819,13 +842,66 @@ def set_material(
     
 @mcp.tool()
 def execute_blender_code(ctx: Context, code: str) -> str:
+    """Execute Python code in Blender synchronously and return its stdout.
+
+    Best for quick operations. For large or long-running work (e.g. creating
+    hundreds of objects, which can exceed the request/response timeout) use
+    start_blender_job() instead — it returns immediately and is polled.
+    """
     try:
         blender = get_blender_connection()
         result = blender.send_command("execute_code", {"code": code})
         return f"Code executed: {result.get('result', '')}"
     except Exception as e:
         return f"Error: {e!s}"
-    
+
+@mcp.tool()
+def start_blender_job(ctx: Context, code: str) -> str:
+    """Start long-running Blender Python code as a background job.
+
+    Returns a job_id immediately (no timeout, even for very long work), because
+    the code is scheduled on Blender's main loop and the socket call returns at
+    once. Then poll get_blender_job_status(job_id) for progress and
+    get_blender_job_result(job_id) for the final result + scene validation.
+    The executed code receives a JOB dict and may set JOB["objects_created"]
+    and JOB["stage"] for cooperative progress reporting.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("execute_code_async", {"code": code}, timeout=15)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error: {e!s}"
+
+@mcp.tool()
+def get_blender_job_status(ctx: Context, job_id: str) -> str:
+    """Poll the status of a background Blender job (responsive even mid-run).
+
+    Returns status (queued/running/done/failed), elapsed_sec, stage,
+    objects_created and a stdout tail.
+    """
+    try:
+        blender = get_blender_connection(check=False)
+        result = blender.send_command("get_job_status", {"job_id": job_id}, timeout=15)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error: {e!s}"
+
+@mcp.tool()
+def get_blender_job_result(ctx: Context, job_id: str) -> str:
+    """Fetch the final result of a background Blender job.
+
+    Before completion returns ready=false; after completion returns the full
+    stdout plus a validation snapshot (object_count, objects_created,
+    materials_count, camera_exists, saved_path, engine).
+    """
+    try:
+        blender = get_blender_connection(check=False)
+        result = blender.send_command("get_job_result", {"job_id": job_id}, timeout=15)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error: {e!s}"
+
 @mcp.tool()
 def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris") -> str:
     try:
